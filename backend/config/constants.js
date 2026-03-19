@@ -19,7 +19,7 @@ const SCAN_DEFAULTS = {
   batchDelay: 1500,
   maxBatchSize: 10000,
   arbBatchSize: 5000,
-  balanceThreshold: 0.00001,
+  balanceThreshold: 0.0000001,
   gasLimit: 21000
 };
 
