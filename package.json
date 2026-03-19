@@ -1,0 +1,13 @@
+{
+  "name": "blockchain-scanner-2026",
+  "version": "1.0.0",
+  "description": "Blockchain Scanner Backend - Node.js",
+  "private": true,
+  "workspaces": [
+    "backend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=backend",
+    "build": "npm run build --workspace=backend"
+  }
+}

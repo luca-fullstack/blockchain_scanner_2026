@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:bscscan.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  }
+}

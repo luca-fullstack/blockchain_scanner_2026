@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.output/
+.nuxt/
+.env
+*.log
+cert/
+coin.txt
+HASH.txt
+.DS_Store
+Thumbs.db
